@@ -202,8 +202,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "config-watcher"
-version = "0.1.0"
+name = "config_watcher"
+version = "0.9.0"
 dependencies = [
  "futures",
  "futures-stream-ext",
