@@ -114,6 +114,8 @@ let (watcher_handle, mut receiver) = run_config_item_watcher(|| {
     backend::run_config_file_watcher("/config", "*.yaml", Duration::from_secs(1))
 }, &YamlTokenizer, deserialize_my_config)?;
 
+watcher_handle.start().await.unwrap();
+
 // Continuously listen for configuration updates
 while let Some(event) = receiver.recv().await {
     match event {
@@ -142,6 +144,7 @@ while let Some(event) = receiver.recv().await {
         },
     }
 }
+
 ```
 
 ## Contributing
