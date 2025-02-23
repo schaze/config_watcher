@@ -3,8 +3,11 @@ use std::hash::Hasher;
 use std::io;
 use std::path::PathBuf;
 use thiserror::Error;
+use tokio::sync::mpsc::error::SendError;
 use tokio::task::JoinError;
 use twox_hash::XxHash64;
+
+use crate::backend::WatcherCommand;
 
 #[derive(Debug, Error)]
 pub enum WatcherError {
@@ -24,6 +27,8 @@ pub enum WatcherError {
     WatcherError(#[from] kube::runtime::watcher::Error),
     #[error("Mqtt Client error: {0}")]
     MqttClient(#[from] ClientError),
+    #[error("Error sending command to watcher {0}")]
+    SendError(#[from] SendError<WatcherCommand>),
 }
 
 pub fn hash_str(data: &str) -> u64 {
@@ -42,7 +47,7 @@ impl Tokenizer for YamlTokenizer {
     fn tokenize<'a>(&self, content: &'a str) -> Box<dyn Iterator<Item = &'a str> + 'a> {
         Box::new(
             content
-                .split("---")
+                .split("\n---")
                 .map(str::trim)
                 .filter(|s| !s.is_empty()),
         )
