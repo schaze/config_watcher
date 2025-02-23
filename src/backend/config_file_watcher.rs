@@ -10,12 +10,13 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, BufReader};
+use tokio::sync::mpsc;
 use tokio::sync::mpsc::Receiver;
-use tokio::sync::{mpsc, watch};
 use tokio::task::{self};
 use walkdir::WalkDir;
 
 use super::{DocumentEvent, WatcherHandle};
+use crate::backend::WatcherCommand;
 use crate::{hash_str, WatcherError};
 
 pub type AsyncWatcherResult = notify::Result<(
@@ -35,12 +36,22 @@ pub fn run_config_file_watcher<P: AsRef<Path>>(
     debounce: Duration,
 ) -> Result<(WatcherHandle, tokio::sync::mpsc::Receiver<DocumentEvent>), WatcherError> {
     let (event_sender, event_receiver) = mpsc::channel(100);
-    let (stop_sender, mut stop_receiver) = watch::channel(false);
+    let (command_sender, mut command_receiver) = mpsc::channel(1);
 
     let watch_path = watch_path.as_ref().to_path_buf();
     let file_pattern = file_pattern.into();
 
     let handle = tokio::spawn(async move {
+        // Wait for a start command before we begin
+        match command_receiver.recv().await {
+            Some(WatcherCommand::Stop) | None => {
+                // Exit early if Stop command is received or channel is closed
+                log::info!("Watcher received stop command before starting or channel closed");
+                return Ok(());
+            }
+            _ => {}
+        }
+
         // Compute initial file hashes
         let mut file_hashes =
             initial_file_search(&watch_path, &file_pattern, &event_sender).await?;
@@ -56,9 +67,10 @@ pub fn run_config_file_watcher<P: AsRef<Path>>(
                     handle_fs_event(res, &mut file_hashes, &event_sender, &watch_path, &gp).await?;
                 }
 
-                // Check for shutdown signal
-                result = stop_receiver.changed() => {
-                    if should_stop_watcher(result, &stop_receiver) {
+                // Check for control commands
+                Some(command) = command_receiver.recv() => {
+                    if let WatcherCommand::Stop = command {
+                        log::info!("Watcher received stop command");
                         break;
                     }
                 }
@@ -72,8 +84,8 @@ pub fn run_config_file_watcher<P: AsRef<Path>>(
 
     Ok((
         WatcherHandle {
-            stop_sender,
-            handle,
+            command_sender,
+            handle: Some(handle),
         },
         event_receiver,
     ))
@@ -311,19 +323,6 @@ async fn handle_fs_event(
         Err(e) => log::error!("Watch error: {:?}", e),
     }
     Ok(())
-}
-
-fn should_stop_watcher(
-    result: Result<(), tokio::sync::watch::error::RecvError>,
-    stop_receiver: &watch::Receiver<bool>,
-) -> bool {
-    match result {
-        Ok(_) => *stop_receiver.borrow(),
-        Err(_) => {
-            log::warn!("Shutdown sender dropped. Exiting watcher.");
-            true
-        }
-    }
 }
 
 /// Creates an async file watcher.

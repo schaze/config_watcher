@@ -5,7 +5,7 @@ mod config_mqtt_watcher;
 pub use config_file_watcher::*;
 pub use config_map_watcher::*;
 pub use config_mqtt_watcher::*;
-use tokio::sync::watch;
+use tokio::sync::mpsc;
 
 use crate::WatcherError;
 
@@ -17,15 +17,31 @@ pub enum DocumentEvent {
 }
 
 pub struct WatcherHandle {
-    pub(crate) stop_sender: watch::Sender<bool>, // Shutdown signal
-    pub(crate) handle: tokio::task::JoinHandle<Result<(), WatcherError>>,
+    pub(crate) command_sender: mpsc::Sender<WatcherCommand>, // Shutdown signal
+    pub(crate) handle: Option<tokio::task::JoinHandle<Result<(), WatcherError>>>,
 }
 
 impl WatcherHandle {
-    /// Stops the watcher task.
-    pub async fn stop(self) -> Result<(), WatcherError> {
-        let _ = self.stop_sender.send(true); // Send the shutdown signal
-        self.handle.await??;
+    /// starts the watcher. Can only be used once!
+    pub async fn start(&self) -> Result<(), WatcherError> {
+        self.command_sender.send(WatcherCommand::Start).await?;
         Ok(())
     }
+
+    /// Stops the watcher task.
+    pub async fn stop(&mut self) -> Result<(), WatcherError> {
+        self.command_sender.send(WatcherCommand::Stop).await?; // Send the shutdown signal
+        if let Some(handle) = self.handle.take() {
+            handle.await??;
+        } else {
+            log::warn!("Task handle was already taken or not initialized.");
+        }
+
+        Ok(())
+    }
+}
+
+pub enum WatcherCommand {
+    Start,
+    Stop,
 }
