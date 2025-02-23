@@ -41,16 +41,28 @@ pub enum ConfigItemEvent<T> {
 }
 
 pub struct ConfigItemWatcherHandle {
-    task_handle: JoinHandle<Result<(), WatcherError>>,
-    file_watcher_handle: WatcherHandle,
+    task_handle: Option<JoinHandle<Result<(), WatcherError>>>,
+    watcher_backend_handle: WatcherHandle,
     stop_sender: watch::Sender<bool>, // Shutdown signal
 }
 
 impl ConfigItemWatcherHandle {
-    pub async fn stop(self) -> Result<(), WatcherError> {
-        self.file_watcher_handle.stop().await?;
+    /// starts the watcher. Can only be used once!
+    pub async fn start(&self) -> Result<(), WatcherError> {
+        self.watcher_backend_handle.start().await?;
+        Ok(())
+    }
+
+    /// Stops the watcher task.
+    pub async fn stop(&mut self) -> Result<(), WatcherError> {
+        self.watcher_backend_handle.stop().await?;
         let _ = self.stop_sender.send(true); // Send the shutdown signal
-        self.task_handle.await??;
+
+        if let Some(handle) = self.task_handle.take() {
+            handle.await??;
+        } else {
+            log::warn!("Task handle was already taken or not initialized.");
+        }
         Ok(())
     }
 }
@@ -68,9 +80,7 @@ where
     T: Send + Sync + 'static,
     E: Send + Sync + std::fmt::Debug + 'static,
 {
-    // let fp = file_pattern.into();
-    let (file_watcher_handle, mut receiver) = make_watcher_backend()?;
-    // run_config_file_watcher(watch_path, fp.clone(), debounce)?;
+    let (watcher_backend_handle, mut receiver) = make_watcher_backend()?;
     let (event_tx, event_rx) = mpsc::channel(100);
     let (stop_sender, mut stop_receiver) = watch::channel(false);
 
@@ -116,8 +126,8 @@ where
 
     Ok((
         ConfigItemWatcherHandle {
-            task_handle: handle,
-            file_watcher_handle,
+            task_handle: Some(handle),
+            watcher_backend_handle,
             stop_sender,
         },
         event_rx,
@@ -136,13 +146,13 @@ where
 {
     match event {
         DocumentEvent::NewDocument(filename, content) => {
-            log::debug!("Processing file: {:?}", filename);
+            log::debug!("Processing document: {:?}", filename);
 
             let mut events =
                 match process_file(&filename, content, item_hashes, tokenizer, deserialize).await {
                     Ok(events) => events,
                     Err(err) => {
-                        log::error!("Failed to process file {:?}: {:?}", filename, err);
+                        log::error!("Failed to process document {:?}: {:?}", filename, err);
                         vec![] // Skip this event
                     }
                 };
@@ -153,18 +163,18 @@ where
             events
         }
         DocumentEvent::ContentChanged(filename, content) => {
-            log::debug!("Processing file: {:?}", filename);
+            log::debug!("Processing document: {:?}", filename);
             match process_file(&filename, content, item_hashes, tokenizer, deserialize).await {
                 Ok(events) => events,
                 Err(err) => {
-                    log::error!("Failed to process file {:?}: {:?}", filename, err);
+                    log::error!("Failed to process document {:?}: {:?}", filename, err);
                     vec![] // Skip this event
                 }
             }
         }
         // Handle file removal
         DocumentEvent::DocumentRemoved(filename) => {
-            log::debug!("File removed: {:?}", filename);
+            log::debug!("Document removed: {:?}", filename);
 
             let mut events = file_removed(&filename, item_hashes);
             events.push(ConfigItemEvent::RemoveDocument(hash_str(&filename)));

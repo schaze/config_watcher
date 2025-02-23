@@ -7,7 +7,7 @@ use std::{
 };
 use tokio::sync::mpsc;
 
-use super::{DocumentEvent, WatcherHandle};
+use super::{DocumentEvent, WatcherCommand, WatcherHandle};
 use crate::{hash_str, WatcherError};
 
 /// Starts watching a ConfigMap in the given namespace.
@@ -20,9 +20,18 @@ pub fn run_configmap_watcher(
     namespace: String,
 ) -> Result<(WatcherHandle, mpsc::Receiver<DocumentEvent>), WatcherError> {
     let (event_sender, event_receiver) = mpsc::channel(100);
-    let (stop_sender, mut stop_receiver) = tokio::sync::watch::channel(false);
+    let (command_sender, mut command_receiver) = mpsc::channel(1);
 
     let handle = tokio::spawn(async move {
+        // Wait for a start command before we begin
+        match command_receiver.recv().await {
+            Some(WatcherCommand::Stop) | None => {
+                // Exit early if Stop command is received or channel is closed
+                log::info!("Watcher received stop command before starting or channel closed");
+                return Ok(());
+            }
+            _ => {}
+        }
         let Ok(client) = Client::try_default().await else {
             log::error!("Cannot create kubernetes client. Configmap watcher will exit!");
             return Ok(());
@@ -65,8 +74,10 @@ pub fn run_configmap_watcher(
                         _ => {}
                     }
                 },
-                result = stop_receiver.changed() => {
-                    if result.is_ok() && *stop_receiver.borrow() {
+                // Check for control commands
+                Some(command) = command_receiver.recv() => {
+                    if let WatcherCommand::Stop = command {
+                        log::info!("Watcher received stop command");
                         break;
                     }
                 }
@@ -77,8 +88,8 @@ pub fn run_configmap_watcher(
 
     Ok((
         WatcherHandle {
-            stop_sender,
-            handle,
+            command_sender,
+            handle: Some(handle),
         },
         event_receiver,
     ))
