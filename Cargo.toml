@@ -1,6 +1,6 @@
 [package]
 name = "config_watcher"
-version = "0.9.1"
+version = "0.9.2"
 edition = "2021"
 publish = true
 description = "Config Watcher is a Rust library for tracking configuration items from files, Kubernetes ConfigMaps, and MQTT topics, providing real-time updates and structured data parsing."
