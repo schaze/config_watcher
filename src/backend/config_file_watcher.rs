@@ -334,7 +334,14 @@ fn create_async_watcher(debounce: Duration) -> AsyncWatcherResult {
 
     let watcher = new_debouncer(debounce, None, move |res| {
         runtime.block_on(async {
-            tx.send(res).await.unwrap();
+            if !tx.is_closed() {
+                match tx.send(res).await {
+                    Ok(_) => {}
+                    Err(err) => {
+                        log::error!("Error sending file watcher event: {}", err);
+                    }
+                }
+            }
         })
     })?;
 
