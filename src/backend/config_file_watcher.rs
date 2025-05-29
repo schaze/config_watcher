@@ -1,28 +1,19 @@
 use glob::Pattern;
 use notify::event::{AccessKind, AccessMode, CreateKind, ModifyKind, RemoveKind, RenameMode};
-use notify::RecursiveMode;
-use notify::{EventKind, INotifyWatcher};
-use notify_debouncer_full::new_debouncer;
-use notify_debouncer_full::{self, RecommendedCache};
-use notify_debouncer_full::{DebouncedEvent, Debouncer};
+use notify::EventKind;
+use notify::{RecursiveMode, Watcher};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, BufReader};
+use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
-use tokio::sync::mpsc::Receiver;
 use tokio::task::{self};
 use walkdir::WalkDir;
 
 use super::{DocumentEvent, WatcherHandle};
 use crate::backend::WatcherCommand;
 use crate::{hash_str, WatcherError};
-
-pub type AsyncWatcherResult = notify::Result<(
-    Debouncer<INotifyWatcher, RecommendedCache>,
-    Receiver<Result<Vec<notify_debouncer_full::DebouncedEvent>, Vec<notify::Error>>>,
-)>;
 
 /// Starts watching the directory for changes in a background task.
 ///
@@ -33,7 +24,6 @@ pub type AsyncWatcherResult = notify::Result<(
 pub fn run_config_file_watcher<P: AsRef<Path>>(
     watch_path: P,
     file_pattern: impl Into<String>,
-    debounce: Duration,
 ) -> Result<(WatcherHandle, tokio::sync::mpsc::Receiver<DocumentEvent>), WatcherError> {
     let (event_sender, event_receiver) = mpsc::channel(100);
     let (command_sender, mut command_receiver) = mpsc::channel(1);
@@ -56,7 +46,9 @@ pub fn run_config_file_watcher<P: AsRef<Path>>(
         let mut file_hashes =
             initial_file_search(&watch_path, &file_pattern, &event_sender).await?;
 
-        let (mut watcher, mut rx) = create_async_watcher(debounce)?;
+        let (wh, mut rx) = AsyncWatcherHandler::new();
+        let mut watcher = notify::recommended_watcher(wh)?;
+
         watcher.watch(&watch_path, RecursiveMode::Recursive)?;
         let gp = Pattern::new(&file_pattern)?;
 
@@ -175,177 +167,187 @@ async fn read_file(path: &Path) -> Result<String, WatcherError> {
 
 /// Processes file system events.
 async fn handle_fs_event(
-    res: Result<Vec<DebouncedEvent>, Vec<notify::Error>>,
+    //res: Result<Vec<DebouncedEvent>, Vec<notify::Error>>,
+    event: notify::Event,
     file_hashes: &mut HashMap<PathBuf, u64>,
     event_sender: &tokio::sync::mpsc::Sender<DocumentEvent>,
     watch_path: &PathBuf,
     gp: &Pattern,
 ) -> Result<(), WatcherError> {
-    match res {
-        Ok(events) => {
-            for event in events {
-                if match_path(watch_path, gp, &event) {
-                    match event.kind {
-                        EventKind::Create(CreateKind::File)
-                        | EventKind::Modify(ModifyKind::Data(_))
-                        | EventKind::Access(AccessKind::Close(AccessMode::Write)) => {
-                            if let Some(path) = event.paths.first() {
-                                let content = read_file(path).await?;
-                                // Compute the new hash for the file
-                                let new_hash = hash_str(&content);
+    //log::debug!("EVENT: {:?}", event);
+    if match_path(watch_path, gp, &event) {
+        match event.kind {
+            EventKind::Create(CreateKind::File)
+            | EventKind::Modify(ModifyKind::Data(_))
+            | EventKind::Access(AccessKind::Close(AccessMode::Write)) => {
+                if let Some(path) = event.paths.first() {
+                    let content = read_file(path).await?;
+                    // Compute the new hash for the file
+                    let new_hash = hash_str(&content);
 
-                                if let Some(existing_hash) = file_hashes.get(path) {
-                                    // File exists: Check if the hash has changed
-                                    if existing_hash != &new_hash {
-                                        // Content changed: Update the hash and emit `ContentChanged`
-                                        file_hashes.insert(path.to_path_buf(), new_hash);
-                                        event_sender
-                                            .send(DocumentEvent::ContentChanged(
-                                                path.to_string_lossy().into_owned(),
-                                                content,
-                                            ))
-                                            .await
-                                            .unwrap();
-                                    }
-                                } else {
-                                    // File does not exist in `file_hashes`: It's a new file
+                    if let Some(existing_hash) = file_hashes.get(path) {
+                        // File exists: Check if the hash has changed
+                        if existing_hash != &new_hash {
+                            // Content changed: Update the hash and emit `ContentChanged`
+                            file_hashes.insert(path.to_path_buf(), new_hash);
+                            event_sender
+                                .send(DocumentEvent::ContentChanged(
+                                    path.to_string_lossy().into_owned(),
+                                    content,
+                                ))
+                                .await
+                                .unwrap();
+                        }
+                    } else {
+                        // File does not exist in `file_hashes`: It's a new file
+                        file_hashes.insert(path.to_path_buf(), new_hash);
+                        event_sender
+                            .send(DocumentEvent::NewDocument(
+                                path.to_string_lossy().into_owned(),
+                                content,
+                            ))
+                            .await
+                            .unwrap();
+                    }
+                }
+            }
+            EventKind::Remove(RemoveKind::File) => {
+                if let Some(path) = event.paths.first() {
+                    if file_hashes.remove(path).is_some() {
+                        event_sender
+                            .send(DocumentEvent::DocumentRemoved(
+                                path.to_string_lossy().into_owned(),
+                            ))
+                            .await
+                            .unwrap();
+                    }
+                }
+            }
+            EventKind::Modify(ModifyKind::Name(mode)) => {
+                match mode {
+                    RenameMode::To => {
+                        if let Some(path) = event.paths.first() {
+                            let content = read_file(path).await?;
+                            // Compute the new hash for the file
+                            let new_hash = hash_str(&content);
+
+                            if let Some(existing_hash) = file_hashes.get(path) {
+                                // File exists: Check if the hash has changed
+                                if existing_hash != &new_hash {
+                                    // Content changed: Update the hash and emit `ContentChanged`
                                     file_hashes.insert(path.to_path_buf(), new_hash);
                                     event_sender
-                                        .send(DocumentEvent::NewDocument(
+                                        .send(DocumentEvent::ContentChanged(
                                             path.to_string_lossy().into_owned(),
                                             content,
                                         ))
                                         .await
                                         .unwrap();
                                 }
+                            } else {
+                                // File does not exist in `file_hashes`: It's a new file
+                                file_hashes.insert(path.to_path_buf(), new_hash);
+                                event_sender
+                                    .send(DocumentEvent::NewDocument(
+                                        path.to_string_lossy().into_owned(),
+                                        content,
+                                    ))
+                                    .await
+                                    .unwrap();
                             }
                         }
-                        EventKind::Remove(RemoveKind::File) => {
-                            if let Some(path) = event.paths.first() {
-                                if file_hashes.remove(path).is_some() {
-                                    event_sender
-                                        .send(DocumentEvent::DocumentRemoved(
-                                            path.to_string_lossy().into_owned(),
-                                        ))
-                                        .await
-                                        .unwrap();
-                                }
+                    }
+                    RenameMode::From => {
+                        if let Some(path) = event.paths.first() {
+                            if file_hashes.remove(path).is_some() {
+                                event_sender
+                                    .send(DocumentEvent::DocumentRemoved(
+                                        path.to_string_lossy().into_owned(),
+                                    ))
+                                    .await
+                                    .unwrap();
                             }
                         }
-                        EventKind::Modify(ModifyKind::Name(mode)) => {
-                            match mode {
-                                RenameMode::To => {
-                                    if let Some(path) = event.paths.first() {
-                                        let content = read_file(path).await?;
-                                        // Compute the new hash for the file
-                                        let new_hash = hash_str(&content);
+                    }
+                    RenameMode::Both => {
+                        if let [from, to, ..] = &event.paths[..] {
+                            // Remove the hash for the `from` file
+                            if file_hashes.remove(from).is_some() {
+                                event_sender
+                                    .send(DocumentEvent::DocumentRemoved(
+                                        from.to_string_lossy().into_owned(),
+                                    ))
+                                    .await
+                                    .unwrap();
 
-                                        if let Some(existing_hash) = file_hashes.get(path) {
-                                            // File exists: Check if the hash has changed
-                                            if existing_hash != &new_hash {
-                                                // Content changed: Update the hash and emit `ContentChanged`
-                                                file_hashes.insert(path.to_path_buf(), new_hash);
-                                                event_sender
-                                                    .send(DocumentEvent::ContentChanged(
-                                                        path.to_string_lossy().into_owned(),
-                                                        content,
-                                                    ))
-                                                    .await
-                                                    .unwrap();
-                                            }
-                                        } else {
-                                            // File does not exist in `file_hashes`: It's a new file
-                                            file_hashes.insert(path.to_path_buf(), new_hash);
-                                            event_sender
-                                                .send(DocumentEvent::NewDocument(
-                                                    path.to_string_lossy().into_owned(),
-                                                    content,
-                                                ))
-                                                .await
-                                                .unwrap();
-                                        }
-                                    }
-                                }
-                                RenameMode::From => {
-                                    if let Some(path) = event.paths.first() {
-                                        if file_hashes.remove(path).is_some() {
-                                            event_sender
-                                                .send(DocumentEvent::DocumentRemoved(
-                                                    path.to_string_lossy().into_owned(),
-                                                ))
-                                                .await
-                                                .unwrap();
-                                        }
-                                    }
-                                }
-                                RenameMode::Both => {
-                                    if let [from, to, ..] = &event.paths[..] {
-                                        // Remove the hash for the `from` file
-                                        if file_hashes.remove(from).is_some() {
-                                            event_sender
-                                                .send(DocumentEvent::DocumentRemoved(
-                                                    from.to_string_lossy().into_owned(),
-                                                ))
-                                                .await
-                                                .unwrap();
+                                // Compute the hash for the `to` file to check for changes
+                                let content = read_file(from).await?;
 
-                                            // Compute the hash for the `to` file to check for changes
-                                            let content = read_file(from).await?;
+                                // Compute the new hash for the file
+                                let new_hash = hash_str(&content);
 
-                                            // Compute the new hash for the file
-                                            let new_hash = hash_str(&content);
-
-                                            file_hashes.insert(to.to_path_buf(), new_hash);
-                                            event_sender
-                                                .send(DocumentEvent::NewDocument(
-                                                    to.to_string_lossy().into_owned(),
-                                                    content,
-                                                ))
-                                                .await
-                                                .unwrap();
-                                        }
-                                    }
-                                }
-                                _ => {
-                                    // log::debug!("Unhandled Rename Event: {:?}", event);
-                                }
+                                file_hashes.insert(to.to_path_buf(), new_hash);
+                                event_sender
+                                    .send(DocumentEvent::NewDocument(
+                                        to.to_string_lossy().into_owned(),
+                                        content,
+                                    ))
+                                    .await
+                                    .unwrap();
                             }
                         }
-                        _ => {
-                            // log::debug!("Unhandled Event: {:?}", event);
-                        }
+                    }
+                    _ => {
+                        //log::debug!("Unhandled Rename Event: {:?}", event);
                     }
                 }
             }
-            // log::debug!("Files: {:#?}", file_hashes);
-            // log::debug!("");
+            _ => {
+                // log::debug!("Unhandled Event: {:?}", event);
+            }
         }
-        Err(e) => log::error!("Watch error: {:?}", e),
+    } else {
+        // log::debug!("Filepattern not matched for event:  {:?}", event);
     }
     Ok(())
 }
 
-/// Creates an async file watcher.
-///
-/// This function sets up a debouncer for watching file system changes.
-fn create_async_watcher(debounce: Duration) -> AsyncWatcherResult {
-    let (tx, rx) = mpsc::channel(100);
-    let runtime = tokio::runtime::Runtime::new().unwrap();
+pub struct AsyncWatcherHandler {
+    tx: mpsc::Sender<notify::Event>,
+    runtime: Runtime,
+}
 
-    let watcher = new_debouncer(debounce, None, move |res| {
-        runtime.block_on(async {
-            if !tx.is_closed() {
-                match tx.send(res).await {
-                    Ok(_) => {}
-                    Err(err) => {
-                        log::error!("Error sending file watcher event: {}", err);
+impl AsyncWatcherHandler {
+    pub fn new() -> (Self, mpsc::Receiver<notify::Event>) {
+        let (tx, rx) = mpsc::channel(100);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        (Self { tx, runtime }, rx)
+    }
+}
+
+impl notify::EventHandler for AsyncWatcherHandler {
+    fn handle_event(&mut self, event: notify::Result<notify::Event>) {
+        match event {
+            Ok(event) => self.runtime.block_on(async {
+                if !self.tx.is_closed() {
+                    match self.tx.send(event).await {
+                        Ok(_) => {}
+                        Err(err) => {
+                            log::error!("Error sending file watcher event: {}", err);
+                        }
                     }
+                } else {
+                    log::warn!(
+                        "Debounce Channel closed before all events could be sent: {:?}",
+                        event
+                    );
                 }
+            }),
+            Err(err) => {
+                log::error!("Error watching files: {}", err);
             }
-        })
-    })?;
-
-    Ok((watcher, rx))
+        }
+    }
 }
 
 /// Matches a path against the file pattern.
@@ -354,7 +356,7 @@ fn create_async_watcher(debounce: Duration) -> AsyncWatcherResult {
 /// * `watch_path` - The base path to watch.
 /// * `gp` - The glob pattern for filtering.
 /// * `event` - The file system event to match.
-fn match_path<P: AsRef<Path>>(watch_path: P, gp: &Pattern, event: &DebouncedEvent) -> bool {
+fn match_path<P: AsRef<Path>>(watch_path: P, gp: &Pattern, event: &notify::Event) -> bool {
     event.paths.iter().any(|path| {
         if let Ok(removed_base) = path.strip_prefix(&watch_path) {
             gp.matches(removed_base.to_str().unwrap_or_default())
