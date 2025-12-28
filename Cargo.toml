@@ -1,6 +1,6 @@
 [package]
 name = "config_watcher"
-version = "0.10.1"
+version = "0.10.2"
 edition = "2021"
 publish = true
 description = "Config Watcher is a Rust library for tracking configuration items from files, Kubernetes ConfigMaps, and MQTT topics, providing real-time updates and structured data parsing."
@@ -12,8 +12,7 @@ keywords = ["config", "file", "mqtt", "kubernetes"]
 
 [features]
 default = ["tls-aws-lc-rs"]
-# Default TLS backend (forwarded into kube)
-tls-aws-lc-rs = ["kube/aws-lc-rs"]
+tls-aws-lc-rs = ["kube/rustls-tls", "kube/aws-lc-rs"]
 
 [dependencies]
 glob = "0.3.2"
