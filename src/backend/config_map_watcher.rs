@@ -102,7 +102,7 @@ pub fn run_configmap_watcher(
     ))
 }
 
-fn combine_configmap_data(cm: &ConfigMap) -> BTreeMap<String, Cow<str>> {
+fn combine_configmap_data(cm: &'_ ConfigMap) -> BTreeMap<String, Cow<'_, str>> {
     let mut result = BTreeMap::new();
 
     if let Some(data) = &cm.data {
