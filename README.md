@@ -147,6 +147,18 @@ while let Some(event) = receiver.recv().await {
 
 ```
 
+### TLS Crypto Provides
+
+`config_watcher` will use `aws-lc-rs` as default TLS backend for kube (which will install it globally).
+If you prefer to use another provider manually in your application set default features to false:
+
+```toml
+[dependencies]
+config_watcher = { version = "0.10.1", default-features = false }
+```
+
+Please note that you will need to install the provider manually in your application in this case, otherwise your application will panic at runtime!
+
 ## Contributing
 
 Contributions are welcome! Please submit a pull request or open an issue for discussion.
