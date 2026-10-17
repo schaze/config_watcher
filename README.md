@@ -36,16 +36,14 @@ Monitors local files for changes and updates the configuration dynamically.
 
 ```rust
 use config_watcher::backend::run_config_file_watcher;
-use std::time::Duration;
 
-let watcher = run_config_file_watcher("/config", "*.yaml", Duration::from_secs(1));
+let watcher = run_config_file_watcher("/config", "*.yaml");
 ```
 
 **Parameters:**
 
 - `watch_path: impl AsRef<Path>` – The directory or file path to watch.
 - `file_pattern: impl Into<String>` – The glob pattern to match files (e.g., `*.yaml`).
-- `debounce: Duration` – The debounce interval for reducing redundant events.
 
 ### 2. Kubernetes ConfigMap Watcher
 
@@ -94,6 +92,7 @@ Config Watcher provides real-time updates for configuration items by leveraging 
 - **RemoveDocument(u64)**: Indicates that a document was removed. The `u64` identifier allows the system to properly correlate the deletion with previous content.
 - **New(ConfigItemHash, T)**: Represents a new configuration item being introduced inside an existing document. The `ConfigItemHash` is a hash-based identifier ensuring unique tracking, and `T` is the deserialized configuration object.
 - **Removed(ConfigItemHash)**: Signifies that a specific configuration item has been removed. The hash ensures that only the affected item is processed without interfering with unrelated configurations.
+- **Invalid { document: u64, name: String, error: String }**: An item of the document could not be deserialized and was skipped. `document` and `name` are the identifier and name from `NewDocument`, and `error` is the deserializer's message (its `Display`). The deserializer's error type must implement `Display`. If the item was valid before, a `Removed` event for it is emitted as well.
 
 ### How to Use `run_config_item_watcher`
 
@@ -111,7 +110,7 @@ When executed, the function returns a handle to manage the watcher and a receive
 // Initialize the configuration watcher
 let (watcher_handle, mut receiver) = run_config_item_watcher(|| {
     // Choose the backend: in this case, watching a directory for YAML files
-    backend::run_config_file_watcher("/config", "*.yaml", Duration::from_secs(1))
+    backend::run_config_file_watcher("/config", "*.yaml")
 }, &YamlTokenizer, deserialize_my_config)?;
 
 watcher_handle.start().await.unwrap();
@@ -124,28 +123,41 @@ while let Some(event) = receiver.recv().await {
             // `id` is an internal identifier for tracking the document
             // `path` represents the document path (filename, attribute in a ConfigMap, or topic in MQTT)
             // This allows the application to map file IDs to filenames and display relevant paths to users
-            println!("New document detected: {}", id);
+            tracing::info!(document = %path, "config document added");
             // Process the new document
         },
         // Handle removed documents
         ConfigItemEvent::RemoveDocument(id) => {
-            println!("Document removed: {}", id);
+            tracing::info!(document = id, "config document removed");
             // Perform any necessary cleanup
         },
         // Handle newly added configuration items
         ConfigItemEvent::New(hash, item) => {
-            println!("New item detected: {:?}", hash);
+            tracing::debug!(item = %hash, "config item added");
             // Process the new configuration item
         },
         // Handle removed configuration items
         ConfigItemEvent::Removed(hash) => {
-            println!("Configuration item removed: {:?}", hash);
+            tracing::debug!(item = %hash, "config item removed");
             // Perform any necessary cleanup
+        },
+        // Report items that could not be deserialized
+        ConfigItemEvent::Invalid { name, error, .. } => {
+            tracing::warn!(file = %name, error = %error, "invalid config item skipped");
         },
     }
 }
 
 ```
+
+### Logging
+
+Config Watcher logs through [`tracing`](https://docs.rs/tracing) under the target `config_watcher` and
+installs no subscriber. It logs at DEBUG and TRACE, plus WARN for problems it handles itself that the
+application cannot otherwise see. Examples are a backend connection that was lost (logged once, with the
+retries at DEBUG), a payload that is not UTF-8, or a backend task that ended early with an error. Errors it
+returns are not logged. Each `WatcherError` displays as one line, and its cause is available through
+`std::error::Error::source()`, so log the whole chain to see the cause.
 
 ### TLS Crypto Provides
 
@@ -154,7 +166,7 @@ If you prefer to use another provider manually in your application set default f
 
 ```toml
 [dependencies]
-config_watcher = { version = "0.10.1", default-features = false }
+config_watcher = { version = "0.12.0", default-features = false }
 ```
 
 Please note that you will need to install the provider manually in your application in this case, otherwise your application will panic at runtime!

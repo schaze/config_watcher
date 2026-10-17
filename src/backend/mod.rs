@@ -5,7 +5,9 @@ mod config_mqtt_watcher;
 pub use config_file_watcher::*;
 pub use config_map_watcher::*;
 pub use config_mqtt_watcher::*;
-use tokio::sync::mpsc;
+use std::future::Future;
+use tokio::{sync::mpsc, task::JoinHandle};
+use tracing::debug;
 
 use crate::WatcherError;
 
@@ -34,7 +36,7 @@ impl WatcherHandle {
         if let Some(handle) = self.handle.take() {
             handle.await??;
         } else {
-            log::warn!("Task handle was already taken or not initialized.");
+            debug!("watcher task handle already taken");
         }
 
         Ok(())
@@ -44,4 +46,24 @@ impl WatcherHandle {
 pub enum WatcherCommand {
     Start,
     Stop,
+}
+
+/// Spawns a backend task and calls `log_error` if it ends with an error.
+///
+/// Such an error ends the task early and the caller can at most observe it through `stop()`,
+/// so it is logged once here. This is the only place where the crate logs an error it returns.
+pub(crate) fn spawn_backend_task<F>(
+    task: F,
+    log_error: impl FnOnce(&WatcherError) + Send + 'static,
+) -> JoinHandle<Result<(), WatcherError>>
+where
+    F: Future<Output = Result<(), WatcherError>> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let result = task.await;
+        if let Err(err) = &result {
+            log_error(err);
+        }
+        result
+    })
 }
