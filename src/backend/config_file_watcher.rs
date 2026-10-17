@@ -131,6 +131,9 @@ async fn find_matching_files<P: AsRef<Path>>(
 ///
 /// # Returns
 /// A `HashMap` where the keys are file paths and the values are their respective hashes.
+///
+/// A file that cannot be read is logged and skipped; it is loaded once a later change makes it
+/// readable.
 async fn initial_file_search<P: AsRef<Path>>(
     watch_path: P,
     file_pattern: &str,
@@ -140,7 +143,13 @@ async fn initial_file_search<P: AsRef<Path>>(
 
     let mut file_hashes = HashMap::new();
     for file in files {
-        let content = read_file(&file).await?;
+        let content = match read_file(&file).await {
+            Ok(content) => content,
+            Err(err) => {
+                warn!(path = %file.display(), error = %chain(&err), "config file skipped, cannot read it");
+                continue;
+            }
+        };
         file_hashes.insert(file.clone(), hash_str(&content));
         sender
             .send(DocumentEvent::NewDocument(
@@ -467,6 +476,45 @@ mod tests {
             if renamed_seen && !modified {
                 std::fs::write(dir.join("other.yaml"), "changed").unwrap();
                 modified = true;
+            }
+        }
+
+        handle.stop().await.unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unreadable_file_at_startup_is_skipped() {
+        let dir = temp_dir();
+        // invalid UTF-8 cannot be read into a String
+        std::fs::write(dir.join("bad.yaml"), [0xff, 0xfe, 0xfd]).unwrap();
+        std::fs::write(dir.join("good.yaml"), "g").unwrap();
+        let (mut handle, mut rx) = run_config_file_watcher(&dir, "*.yaml").unwrap();
+        handle.start().await.unwrap();
+
+        let first = recv(&mut rx).await;
+        assert!(
+            matches!(&first, DocumentEvent::NewDocument(id, c) if id.ends_with("good.yaml") && c == "g"),
+            "{first:?}"
+        );
+        // let the notify watcher register before changing files
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        std::fs::write(dir.join("good.yaml"), "changed").unwrap();
+        std::fs::write(dir.join("bad.yaml"), "fixed").unwrap();
+        let mut good_changed = false;
+        let mut bad_loaded = false;
+        while !(good_changed && bad_loaded) {
+            match recv(&mut rx).await {
+                DocumentEvent::ContentChanged(id, c)
+                    if id.ends_with("good.yaml") && c == "changed" =>
+                {
+                    good_changed = true
+                }
+                DocumentEvent::NewDocument(id, c) if id.ends_with("bad.yaml") && c == "fixed" => {
+                    bad_loaded = true
+                }
+                _ => {}
             }
         }
 
