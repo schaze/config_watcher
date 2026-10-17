@@ -172,8 +172,10 @@ async fn read_file(path: &Path) -> Result<String, WatcherError> {
 }
 
 /// Processes file system events.
+///
+/// A file that cannot be read is logged and skipped so the watcher keeps running; only a closed
+/// event channel ends it.
 async fn handle_fs_event(
-    //res: Result<Vec<DebouncedEvent>, Vec<notify::Error>>,
     event: notify::Event,
     file_hashes: &mut HashMap<PathBuf, u64>,
     event_sender: &tokio::sync::mpsc::Sender<DocumentEvent>,
@@ -184,131 +186,77 @@ async fn handle_fs_event(
         match event.kind {
             EventKind::Create(CreateKind::File)
             | EventKind::Modify(ModifyKind::Data(_))
-            | EventKind::Access(AccessKind::Close(AccessMode::Write)) => {
+            | EventKind::Access(AccessKind::Close(AccessMode::Write))
+            | EventKind::Modify(ModifyKind::Name(RenameMode::To)) => {
                 if let Some(path) = event.paths.first() {
-                    let content = read_file(path).await?;
-                    // Compute the new hash for the file
-                    let new_hash = hash_str(&content);
-
-                    if let Some(existing_hash) = file_hashes.get(path) {
-                        // File exists: Check if the hash has changed
-                        if existing_hash != &new_hash {
-                            // Content changed: Update the hash and emit `ContentChanged`
-                            file_hashes.insert(path.to_path_buf(), new_hash);
-                            event_sender
-                                .send(DocumentEvent::ContentChanged(
-                                    path.to_string_lossy().into_owned(),
-                                    content,
-                                ))
-                                .await
-                                .unwrap();
-                        }
-                    } else {
-                        // File does not exist in `file_hashes`: It's a new file
-                        file_hashes.insert(path.to_path_buf(), new_hash);
-                        event_sender
-                            .send(DocumentEvent::NewDocument(
-                                path.to_string_lossy().into_owned(),
-                                content,
-                            ))
-                            .await
-                            .unwrap();
-                    }
+                    upsert_document(path, file_hashes, event_sender).await?;
                 }
             }
-            EventKind::Remove(RemoveKind::File) => {
+            EventKind::Remove(RemoveKind::File)
+            | EventKind::Modify(ModifyKind::Name(RenameMode::From)) => {
                 if let Some(path) = event.paths.first() {
-                    if file_hashes.remove(path).is_some() {
-                        event_sender
-                            .send(DocumentEvent::DocumentRemoved(
-                                path.to_string_lossy().into_owned(),
-                            ))
-                            .await
-                            .unwrap();
-                    }
+                    remove_document(path, file_hashes, event_sender).await?;
                 }
             }
-            EventKind::Modify(ModifyKind::Name(mode)) => {
-                match mode {
-                    RenameMode::To => {
-                        if let Some(path) = event.paths.first() {
-                            let content = read_file(path).await?;
-                            // Compute the new hash for the file
-                            let new_hash = hash_str(&content);
-
-                            if let Some(existing_hash) = file_hashes.get(path) {
-                                // File exists: Check if the hash has changed
-                                if existing_hash != &new_hash {
-                                    // Content changed: Update the hash and emit `ContentChanged`
-                                    file_hashes.insert(path.to_path_buf(), new_hash);
-                                    event_sender
-                                        .send(DocumentEvent::ContentChanged(
-                                            path.to_string_lossy().into_owned(),
-                                            content,
-                                        ))
-                                        .await
-                                        .unwrap();
-                                }
-                            } else {
-                                // File does not exist in `file_hashes`: It's a new file
-                                file_hashes.insert(path.to_path_buf(), new_hash);
-                                event_sender
-                                    .send(DocumentEvent::NewDocument(
-                                        path.to_string_lossy().into_owned(),
-                                        content,
-                                    ))
-                                    .await
-                                    .unwrap();
-                            }
-                        }
+            EventKind::Modify(ModifyKind::Name(RenameMode::Both)) => {
+                if let [from, to, ..] = &event.paths[..] {
+                    remove_document(from, file_hashes, event_sender).await?;
+                    if path_matches(watch_path, gp, to) {
+                        upsert_document(to, file_hashes, event_sender).await?;
                     }
-                    RenameMode::From => {
-                        if let Some(path) = event.paths.first() {
-                            if file_hashes.remove(path).is_some() {
-                                event_sender
-                                    .send(DocumentEvent::DocumentRemoved(
-                                        path.to_string_lossy().into_owned(),
-                                    ))
-                                    .await
-                                    .unwrap();
-                            }
-                        }
-                    }
-                    RenameMode::Both => {
-                        if let [from, to, ..] = &event.paths[..] {
-                            // Remove the hash for the `from` file
-                            if file_hashes.remove(from).is_some() {
-                                event_sender
-                                    .send(DocumentEvent::DocumentRemoved(
-                                        from.to_string_lossy().into_owned(),
-                                    ))
-                                    .await
-                                    .unwrap();
-
-                                // Compute the hash for the `to` file to check for changes
-                                let content = read_file(from).await?;
-
-                                // Compute the new hash for the file
-                                let new_hash = hash_str(&content);
-
-                                file_hashes.insert(to.to_path_buf(), new_hash);
-                                event_sender
-                                    .send(DocumentEvent::NewDocument(
-                                        to.to_string_lossy().into_owned(),
-                                        content,
-                                    ))
-                                    .await
-                                    .unwrap();
-                            }
-                        }
-                    }
-                    _ => {}
                 }
             }
             _ => {}
         }
     }
     Ok(())
+}
+
+/// Reads `path` and emits `NewDocument` or, if its content changed, `ContentChanged`.
+async fn upsert_document(
+    path: &Path,
+    file_hashes: &mut HashMap<PathBuf, u64>,
+    event_sender: &mpsc::Sender<DocumentEvent>,
+) -> Result<(), WatcherError> {
+    let content = match read_file(path).await {
+        Ok(content) => content,
+        Err(err) => {
+            warn!(path = %path.display(), error = %chain(&err), "config file skipped, cannot read it");
+            return Ok(());
+        }
+    };
+    let new_hash = hash_str(&content);
+    let id = path.to_string_lossy().into_owned();
+    match file_hashes.insert(path.to_path_buf(), new_hash) {
+        Some(old_hash) if old_hash == new_hash => Ok(()),
+        Some(_) => send_event(event_sender, DocumentEvent::ContentChanged(id, content)).await,
+        None => send_event(event_sender, DocumentEvent::NewDocument(id, content)).await,
+    }
+}
+
+async fn remove_document(
+    path: &Path,
+    file_hashes: &mut HashMap<PathBuf, u64>,
+    event_sender: &mpsc::Sender<DocumentEvent>,
+) -> Result<(), WatcherError> {
+    if file_hashes.remove(path).is_some() {
+        send_event(
+            event_sender,
+            DocumentEvent::DocumentRemoved(path.to_string_lossy().into_owned()),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn send_event(
+    event_sender: &mpsc::Sender<DocumentEvent>,
+    event: DocumentEvent,
+) -> Result<(), WatcherError> {
+    event_sender
+        .send(event)
+        .await
+        .map_err(|_| WatcherError::Notify(notify::Error::generic("Failed to send event")))
 }
 
 pub struct AsyncWatcherHandler {
@@ -356,11 +304,173 @@ impl notify::EventHandler for AsyncWatcherHandler {
 /// * `gp` - The glob pattern for filtering.
 /// * `event` - The file system event to match.
 fn match_path<P: AsRef<Path>>(watch_path: P, gp: &Pattern, event: &notify::Event) -> bool {
-    event.paths.iter().any(|path| {
-        if let Ok(removed_base) = path.strip_prefix(&watch_path) {
-            gp.matches(removed_base.to_str().unwrap_or_default())
-        } else {
-            false
+    event
+        .paths
+        .iter()
+        .any(|path| path_matches(&watch_path, gp, path))
+}
+
+fn path_matches<P: AsRef<Path>>(watch_path: P, gp: &Pattern, path: &Path) -> bool {
+    if let Ok(removed_base) = path.strip_prefix(&watch_path) {
+        gp.matches(removed_base.to_str().unwrap_or_default())
+    } else {
+        false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use notify::event::{EventKind, ModifyKind, RenameMode};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    fn temp_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "config_watcher_fs_{}_{}",
+            std::process::id(),
+            DIR_COUNTER.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn drain(rx: &mut mpsc::Receiver<DocumentEvent>) -> Vec<DocumentEvent> {
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
         }
-    })
+        events
+    }
+
+    #[tokio::test]
+    async fn rename_both_reads_the_new_path() {
+        let dir = temp_dir();
+        let from = dir.join("a.yaml");
+        let to = dir.join("b.yaml");
+        std::fs::write(&to, "content").unwrap();
+        let mut hashes = HashMap::from([(from.clone(), hash_str("content"))]);
+        let (tx, mut rx) = mpsc::channel(10);
+        let event = notify::Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+            .add_path(from.clone())
+            .add_path(to.clone());
+
+        handle_fs_event(
+            event,
+            &mut hashes,
+            &tx,
+            &dir,
+            &Pattern::new("*.yaml").unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let events = drain(&mut rx);
+        assert!(
+            matches!(&events[..], [DocumentEvent::DocumentRemoved(r), DocumentEvent::NewDocument(n, c)]
+                if r == &from.to_string_lossy() && n == &to.to_string_lossy() && c == "content"),
+            "{events:?}"
+        );
+        assert!(hashes.contains_key(&to) && !hashes.contains_key(&from));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn rename_both_from_untracked_path_emits_new_document() {
+        // atomic save: editor writes a temp file and renames it over the watched one
+        let dir = temp_dir();
+        let from = dir.join("a.yaml.tmp");
+        let to = dir.join("a.yaml");
+        std::fs::write(&to, "new").unwrap();
+        let mut hashes = HashMap::from([(to.clone(), hash_str("old"))]);
+        let (tx, mut rx) = mpsc::channel(10);
+        let event = notify::Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+            .add_path(from)
+            .add_path(to.clone());
+
+        handle_fs_event(
+            event,
+            &mut hashes,
+            &tx,
+            &dir,
+            &Pattern::new("*.yaml").unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let events = drain(&mut rx);
+        assert!(
+            matches!(&events[..], [DocumentEvent::ContentChanged(n, c)] if n == &to.to_string_lossy() && c == "new"),
+            "{events:?}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_error_does_not_fail_event_handling() {
+        let dir = temp_dir();
+        let missing = dir.join("gone.yaml");
+        let mut hashes = HashMap::new();
+        let (tx, mut rx) = mpsc::channel(10);
+        let event = notify::Event::new(EventKind::Create(CreateKind::File)).add_path(missing);
+
+        handle_fs_event(
+            event,
+            &mut hashes,
+            &tx,
+            &dir,
+            &Pattern::new("*.yaml").unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert!(drain(&mut rx).is_empty());
+        assert!(hashes.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    async fn recv(rx: &mut mpsc::Receiver<DocumentEvent>) -> DocumentEvent {
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timed out waiting for document event")
+            .expect("watcher channel closed")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn watcher_keeps_running_after_rename() {
+        let dir = temp_dir();
+        std::fs::write(dir.join("a.yaml"), "a").unwrap();
+        std::fs::write(dir.join("other.yaml"), "o").unwrap();
+        let (mut handle, mut rx) = run_config_file_watcher(&dir, "*.yaml").unwrap();
+        handle.start().await.unwrap();
+        // two initial documents
+        recv(&mut rx).await;
+        recv(&mut rx).await;
+        // let the notify watcher register before changing files
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        std::fs::rename(dir.join("a.yaml"), dir.join("b.yaml")).unwrap();
+        let mut renamed_seen = false;
+        let mut other_seen = false;
+        let mut modified = false;
+        while !(renamed_seen && other_seen) {
+            match recv(&mut rx).await {
+                DocumentEvent::NewDocument(id, _) if id.ends_with("b.yaml") => renamed_seen = true,
+                DocumentEvent::ContentChanged(id, c)
+                    if id.ends_with("other.yaml") && c == "changed" =>
+                {
+                    other_seen = true
+                }
+                _ => {}
+            }
+            if renamed_seen && !modified {
+                std::fs::write(dir.join("other.yaml"), "changed").unwrap();
+                modified = true;
+            }
+        }
+
+        handle.stop().await.unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }
