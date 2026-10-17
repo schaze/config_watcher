@@ -9,25 +9,26 @@ use twox_hash::XxHash64;
 
 use crate::backend::WatcherCommand;
 
+/// Each `Display` is one line without the cause; the cause is available through `source()`.
 #[derive(Debug, Error)]
 pub enum WatcherError {
-    #[error("Error watching files {:#?}", .0)]
+    #[error("file watcher error")]
     Notify(#[from] notify::Error),
-    #[error("Error matching glob pattern {:#?}", .0)]
+    #[error("invalid glob pattern")]
     Pattern(#[from] glob::PatternError),
-    #[error("Error hashing file [{0}]: {1:?}")]
-    HashError(PathBuf, io::Error),
-    #[error("Error waiting for watch task to complete: {0} -- {0:#?}")]
+    #[error("cannot hash file {0}")]
+    HashError(PathBuf, #[source] io::Error),
+    #[error("watcher task failed")]
     JoinError(#[from] JoinError),
-    #[error("Error reading file [{0}]: {1:?}")]
-    FileReadError(PathBuf, io::Error),
-    #[error("Kubernetes API error: {0}")]
+    #[error("cannot read file {0}")]
+    FileReadError(PathBuf, #[source] io::Error),
+    #[error("Kubernetes API error")]
     KubeError(#[from] kube::Error),
-    #[error("Kubernetes watcher API error: {0}")]
+    #[error("Kubernetes watcher error")]
     WatcherError(#[from] kube::runtime::watcher::Error),
-    #[error("Mqtt Client error: {0}")]
+    #[error("MQTT client error")]
     MqttClient(#[from] ClientError),
-    #[error("Error sending command to watcher {0}")]
+    #[error("cannot send command to watcher")]
     SendError(#[from] SendError<WatcherCommand>),
 }
 

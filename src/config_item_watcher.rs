@@ -1,4 +1,5 @@
 use crate::backend::{DocumentEvent, WatcherHandle};
+use crate::logging::{truncate, PAYLOAD_MAX};
 use crate::{hash_str, Tokenizer, WatcherError};
 use std::{
     collections::{HashMap, HashSet},
@@ -11,6 +12,7 @@ use tokio::{
     },
     task::JoinHandle,
 };
+use tracing::debug;
 
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub struct ConfigItemHash(u64, u64);
@@ -38,6 +40,13 @@ pub enum ConfigItemEvent<T> {
     RemoveDocument(u64),
     New(ConfigItemHash, T),  // Hash and Item
     Removed(ConfigItemHash), // Hash of the removed item
+    /// An item of the document (ID and name as in `NewDocument`) failed to deserialize and was
+    /// skipped; `error` is the deserializer's message.
+    Invalid {
+        document: u64,
+        name: String,
+        error: String,
+    },
 }
 
 pub struct ConfigItemWatcherHandle {
@@ -61,7 +70,7 @@ impl ConfigItemWatcherHandle {
         if let Some(handle) = self.task_handle.take() {
             handle.await??;
         } else {
-            log::warn!("Task handle was already taken or not initialized.");
+            debug!("watcher task handle already taken");
         }
         Ok(())
     }
@@ -78,7 +87,7 @@ pub fn run_config_item_watcher<T, E>(
 ) -> Result<(ConfigItemWatcherHandle, Receiver<ConfigItemEvent<T>>), WatcherError>
 where
     T: Send + Sync + 'static,
-    E: Send + Sync + std::fmt::Debug + 'static,
+    E: Send + Sync + Display + 'static,
 {
     let (watcher_backend_handle, mut receiver) = make_watcher_backend()?;
     let (event_tx, event_rx) = mpsc::channel(100);
@@ -91,7 +100,6 @@ where
 
         async move {
             loop {
-                // log::warn!("waiting for file events: {}", fp);
                 let events = tokio::select! {
                     // Wait for file events
                     Some(event) = receiver.recv() => {
@@ -106,7 +114,7 @@ where
                                 continue;
                             },
                             Err(_) => {
-                                log::warn!("Shutdown sender dropped. Exiting watcher.");
+                                debug!("watcher stop sender dropped");
                                 break;
                             }
                         }
@@ -119,7 +127,7 @@ where
                 }
             }
 
-            log::debug!("Exiting Watcher loop");
+            debug!("config item watcher stopped");
             Ok(())
         }
     });
@@ -142,20 +150,14 @@ async fn handle_config_file_event<T, E>(
 ) -> Vec<ConfigItemEvent<T>>
 where
     T: Send + Sync,
-    E: Send + Sync + std::fmt::Debug,
+    E: Send + Sync + Display,
 {
     match event {
         DocumentEvent::NewDocument(filename, content) => {
-            log::debug!("Processing document: {:?}", filename);
+            debug!(document = %filename, "document added");
 
             let mut events =
-                match process_file(&filename, content, item_hashes, tokenizer, deserialize).await {
-                    Ok(events) => events,
-                    Err(err) => {
-                        log::error!("Failed to process document {:?}: {:?}", filename, err);
-                        vec![] // Skip this event
-                    }
-                };
+                process_file(&filename, content, item_hashes, tokenizer, deserialize).await;
             events.insert(
                 0,
                 ConfigItemEvent::NewDocument(hash_str(&filename), filename),
@@ -163,18 +165,12 @@ where
             events
         }
         DocumentEvent::ContentChanged(filename, content) => {
-            log::debug!("Processing document: {:?}", filename);
-            match process_file(&filename, content, item_hashes, tokenizer, deserialize).await {
-                Ok(events) => events,
-                Err(err) => {
-                    log::error!("Failed to process document {:?}: {:?}", filename, err);
-                    vec![] // Skip this event
-                }
-            }
+            debug!(document = %filename, "document changed");
+            process_file(&filename, content, item_hashes, tokenizer, deserialize).await
         }
         // Handle file removal
         DocumentEvent::DocumentRemoved(filename) => {
-            log::debug!("Document removed: {:?}", filename);
+            debug!(document = %filename, "document removed");
 
             let mut events = file_removed(&filename, item_hashes);
             events.push(ConfigItemEvent::RemoveDocument(hash_str(&filename)));
@@ -211,10 +207,10 @@ async fn process_file<T, E>(
     item_hashes: &mut HashSet<ConfigItemHash>,
     tokenizer: &dyn Tokenizer,
     deserialize: &impl Fn(&str) -> std::result::Result<T, E>,
-) -> Result<Vec<ConfigItemEvent<T>>, WatcherError>
+) -> Vec<ConfigItemEvent<T>>
 where
     T: Send + Sync,
-    E: Send + Sync + std::fmt::Debug,
+    E: Send + Sync + Display,
 {
     let mut events = Vec::new();
 
@@ -228,12 +224,18 @@ where
         .filter_map(|doc| match deserialize(doc) {
             Ok(item) => Some((hash_str(doc), item)),
             Err(err) => {
-                log::error!(
-                    "Failed to deserialize document in file {:?}:\n{}\n{:?}",
-                    filename,
-                    doc,
-                    err
+                let error = err.to_string();
+                debug!(
+                    document = %filename,
+                    error = %error,
+                    content = %truncate(doc, PAYLOAD_MAX),
+                    "config item deserialization failed"
                 );
+                events.push(ConfigItemEvent::Invalid {
+                    document: filename_hash,
+                    name: filename.to_owned(),
+                    error,
+                });
                 None
             }
         })
@@ -264,5 +266,70 @@ where
         }
     }
 
-    Ok(events)
+    events
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::YamlTokenizer;
+
+    const FILE: &str = "a.yaml";
+
+    fn parse(doc: &str) -> Result<u32, String> {
+        doc.parse().map_err(|_| format!("not a number: {doc}"))
+    }
+
+    async fn load(
+        event: DocumentEvent,
+        hashes: &mut HashSet<ConfigItemHash>,
+    ) -> Vec<ConfigItemEvent<u32>> {
+        handle_config_file_event(event, hashes, &YamlTokenizer, &parse).await
+    }
+
+    #[tokio::test]
+    async fn invalid_item_is_reported_after_new_document() {
+        let mut hashes = HashSet::new();
+        let event = DocumentEvent::NewDocument(FILE.into(), "1\n---\nx".into());
+
+        let events = load(event, &mut hashes).await;
+
+        let document = hash_str(FILE);
+        assert_eq!(events.len(), 3);
+        assert!(matches!(&events[0], ConfigItemEvent::NewDocument(id, _) if *id == document));
+        assert!(matches!(
+            &events[1],
+            ConfigItemEvent::Invalid { document: id, name, error }
+                if *id == document && name == FILE && error == "not a number: x"
+        ));
+        assert!(matches!(&events[2], ConfigItemEvent::New(_, 1)));
+    }
+
+    #[tokio::test]
+    async fn item_that_becomes_invalid_is_removed_and_reported() {
+        let mut hashes = HashSet::new();
+        load(
+            DocumentEvent::NewDocument(FILE.into(), "1".into()),
+            &mut hashes,
+        )
+        .await;
+
+        let events = load(
+            DocumentEvent::ContentChanged(FILE.into(), "y".into()),
+            &mut hashes,
+        )
+        .await;
+
+        let document = hash_str(FILE);
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            &events[0],
+            ConfigItemEvent::Invalid { document: id, .. } if *id == document
+        ));
+        assert!(matches!(
+            &events[1],
+            ConfigItemEvent::Removed(hash) if hash.filename_hash() == document
+        ));
+        assert!(hashes.is_empty());
+    }
 }

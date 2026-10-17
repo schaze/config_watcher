@@ -1,5 +1,6 @@
 pub mod backend;
 pub mod config_item_watcher;
+mod logging;
 mod watcher;
 
 pub use config_item_watcher::*;

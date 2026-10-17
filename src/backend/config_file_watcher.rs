@@ -9,10 +9,12 @@ use tokio::io::{AsyncReadExt, BufReader};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 use tokio::task::{self};
+use tracing::{debug, warn};
 use walkdir::WalkDir;
 
-use super::{DocumentEvent, WatcherHandle};
+use super::{spawn_backend_task, DocumentEvent, WatcherHandle};
 use crate::backend::WatcherCommand;
+use crate::logging::chain;
 use crate::{hash_str, WatcherError};
 
 /// Starts watching the directory for changes in a background task.
@@ -30,13 +32,14 @@ pub fn run_config_file_watcher<P: AsRef<Path>>(
 
     let watch_path = watch_path.as_ref().to_path_buf();
     let file_pattern = file_pattern.into();
+    let log_path = watch_path.clone();
 
-    let handle = tokio::spawn(async move {
+    let task = async move {
         // Wait for a start command before we begin
         match command_receiver.recv().await {
             Some(WatcherCommand::Stop) | None => {
                 // Exit early if Stop command is received or channel is closed
-                log::info!("Watcher received stop command before starting or channel closed");
+                debug!(path = %watch_path.display(), "watcher stopped before start");
                 return Ok(());
             }
             _ => {}
@@ -62,16 +65,19 @@ pub fn run_config_file_watcher<P: AsRef<Path>>(
                 // Check for control commands
                 Some(command) = command_receiver.recv() => {
                     if let WatcherCommand::Stop = command {
-                        log::info!("Watcher received stop command");
+                        debug!(path = %watch_path.display(), "watcher stop received");
                         break;
                     }
                 }
             }
         }
 
-        log::debug!("Exiting ConfigFileWatcher loop");
+        debug!(path = %watch_path.display(), "config file watcher stopped");
 
         Ok(())
+    };
+    let handle = spawn_backend_task(task, move |err| {
+        warn!(path = %log_path.display(), error = %chain(err), "config file watcher failed");
     });
 
     Ok((
@@ -174,7 +180,6 @@ async fn handle_fs_event(
     watch_path: &PathBuf,
     gp: &Pattern,
 ) -> Result<(), WatcherError> {
-    //log::debug!("EVENT: {:?}", event);
     if match_path(watch_path, gp, &event) {
         match event.kind {
             EventKind::Create(CreateKind::File)
@@ -297,17 +302,11 @@ async fn handle_fs_event(
                             }
                         }
                     }
-                    _ => {
-                        //log::debug!("Unhandled Rename Event: {:?}", event);
-                    }
+                    _ => {}
                 }
             }
-            _ => {
-                // log::debug!("Unhandled Event: {:?}", event);
-            }
+            _ => {}
         }
-    } else {
-        // log::debug!("Filepattern not matched for event:  {:?}", event);
     }
     Ok(())
 }
@@ -333,18 +332,18 @@ impl notify::EventHandler for AsyncWatcherHandler {
                     match self.tx.send(event).await {
                         Ok(_) => {}
                         Err(err) => {
-                            log::error!("Error sending file watcher event: {}", err);
+                            debug!(
+                                paths = ?err.0.paths,
+                                "file watcher event dropped, channel closed"
+                            );
                         }
                     }
                 } else {
-                    log::warn!(
-                        "Debounce Channel closed before all events could be sent: {:?}",
-                        event
-                    );
+                    debug!(paths = ?event.paths, "file watcher event dropped, channel closed");
                 }
             }),
             Err(err) => {
-                log::error!("Error watching files: {}", err);
+                warn!(error = %err, "file watch error");
             }
         }
     }

@@ -4,12 +4,13 @@ use kube::{api::Api, runtime::watcher, Client};
 use std::{
     borrow::Cow,
     collections::{BTreeMap, HashMap},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
+use tracing::{debug, warn};
 
-use super::{DocumentEvent, WatcherCommand, WatcherHandle};
-use crate::{hash_str, WatcherError};
+use super::{spawn_backend_task, DocumentEvent, WatcherCommand, WatcherHandle};
+use crate::{hash_str, logging::chain, WatcherError};
 
 /// Starts watching a ConfigMap in the given namespace.
 ///
@@ -23,30 +24,47 @@ pub fn run_configmap_watcher(
     let (event_sender, event_receiver) = mpsc::channel(100);
     let (command_sender, mut command_receiver) = mpsc::channel(1);
 
-    let handle = tokio::spawn(async move {
+    let log_configmap = configmap_name.clone();
+    let log_namespace = namespace.clone();
+
+    let task = async move {
         // Wait for a start command before we begin
         match command_receiver.recv().await {
             Some(WatcherCommand::Stop) | None => {
                 // Exit early if Stop command is received or channel is closed
-                log::info!("Watcher received stop command before starting or channel closed");
+                debug!(
+                    configmap = %configmap_name,
+                    namespace = %namespace,
+                    "watcher stopped before start"
+                );
                 return Ok(());
             }
             _ => {}
         }
-        let Ok(client) = Client::try_default().await else {
-            log::error!("Cannot create kubernetes client. Configmap watcher will exit!");
-            return Ok(());
-        };
+        let client = Client::try_default().await?;
         let api: Api<ConfigMap> = Api::namespaced(client, &namespace);
         let config =
             watcher::Config::default().fields(format!("metadata.name={}", configmap_name).as_str());
         let mut file_hashes: HashMap<String, u64> = HashMap::new();
+        // Start of the current watch outage and the number of failed attempts in it
+        let mut outage: Option<(Instant, u32)> = None;
 
         let mut stream = watcher(api, config).boxed();
         loop {
             tokio::select! {
                event = stream.try_next() =>
                     {
+                        if matches!(event, Ok(Some(_))) {
+                            if let Some((since, attempts)) = outage.take() {
+                                debug!(
+                                    configmap = %configmap_name,
+                                    namespace = %namespace,
+                                    outage_secs = since.elapsed().as_secs(),
+                                    attempts,
+                                    "Kubernetes ConfigMap watch restored"
+                                );
+                            }
+                        }
                         match event {
                             Ok(Some(watcher::Event::Apply(cm))) | Ok(Some(watcher::Event::InitApply(cm))) => {
                                 if cm.metadata.name.as_deref() == Some(&configmap_name) {
@@ -70,11 +88,32 @@ pub fn run_configmap_watcher(
                                 }
                             }
                             Ok(None) => {
-                                log::warn!("==> Kubernetes ConfigMap Watcher stream has ended. There will not be any more config updates.");
+                                warn!(
+                                    configmap = %configmap_name,
+                                    namespace = %namespace,
+                                    "Kubernetes ConfigMap watch stream ended"
+                                );
                                 break;
                             }
                             Err(err) => {
-                                log::error!("==> Error in Kubernetes ConfigMap Watcher: {}", err);
+                                if let Some((_, attempts)) = &mut outage {
+                                    *attempts += 1;
+                                    debug!(
+                                        configmap = %configmap_name,
+                                        namespace = %namespace,
+                                        attempt = *attempts,
+                                        error = %err,
+                                        "Kubernetes ConfigMap watch retry failed"
+                                    );
+                                } else {
+                                    warn!(
+                                        configmap = %configmap_name,
+                                        namespace = %namespace,
+                                        error = %err,
+                                        "Kubernetes ConfigMap watch failed"
+                                    );
+                                    outage = Some((Instant::now(), 1));
+                                }
                                 // wait for 3 seconds before retrying
                                 tokio::time::sleep(Duration::from_secs(3)).await;
                             }
@@ -84,13 +123,25 @@ pub fn run_configmap_watcher(
                 // Check for control commands
                 Some(command) = command_receiver.recv() => {
                     if let WatcherCommand::Stop = command {
-                        log::info!("Watcher received stop command");
+                        debug!(
+                            configmap = %configmap_name,
+                            namespace = %namespace,
+                            "watcher stop received"
+                        );
                         break;
                     }
                 }
             }
         }
         Ok(())
+    };
+    let handle = spawn_backend_task(task, move |err| {
+        warn!(
+            configmap = %log_configmap,
+            namespace = %log_namespace,
+            error = %chain(err),
+            "Kubernetes ConfigMap watcher failed"
+        );
     });
 
     Ok((
@@ -118,7 +169,12 @@ fn combine_configmap_data(cm: &'_ ConfigMap) -> BTreeMap<String, Cow<'_, str>> {
                     result.insert(key.clone(), Cow::Borrowed(as_str));
                 }
                 Err(e) => {
-                    log::error!("Cannot utf8 decode value to string: {:?}", e);
+                    warn!(
+                        configmap = cm.metadata.name.as_deref().unwrap_or_default(),
+                        key = %key,
+                        error = %e,
+                        "ConfigMap binaryData value is not UTF-8"
+                    );
                 }
             }
         }
